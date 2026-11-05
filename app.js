@@ -35,6 +35,9 @@ function defaultState() {
   return {
     version: 1,
     attacks: [], doses: [],
+    // 日ごとの睡眠・運動。キーは YYYY-MM-DD。睡眠はその朝に目覚めた日の値（＝前夜の睡眠）
+    // { sleepMin, exerciseMin, steps, intensityMin, sleepScore, bedtime, wake, activities, manual:{sleepMin?,exerciseMin?} }
+    daily: {},
     meds: [
       { id: 'm1', name: 'トリプタン（薬名に変更）', cat: 'triptan' },
       { id: 'm2', name: 'ロキソプロフェン', cat: 'analgesic' },
@@ -57,6 +60,90 @@ function save() {
   catch (e) { alert('保存に失敗しました: ' + e.message); }
 }
 const medById = id => state.meds.find(m => m.id === id);
+
+// ---------- 睡眠・運動 ----------
+// 手入力した値を Garmin の値より優先する
+const sleepOf = k => { const d = state.daily[k]; if (!d) return null; return d.manual?.sleepMin ?? d.sleepMin ?? null; };
+const exerciseOf = k => { const d = state.daily[k]; if (!d) return null; return d.manual?.exerciseMin ?? d.exerciseMin ?? null; };
+const fmtMin = m => m == null ? '-' : `${Math.floor(m / 60)}時間${m % 60 ? pad(m % 60) + '分' : ''}`;
+const SHORT_SLEEP = 360; // 6時間未満を「短い睡眠」として集計する
+const EXERCISE_DAY = 20; // 20分以上を「運動した日」として集計する
+
+function dailyLine(k) {
+  const d = state.daily[k]; if (!d) return '';
+  const parts = [];
+  const s = sleepOf(k), e = exerciseOf(k);
+  if (s != null) parts.push(`前夜の睡眠 ${fmtMin(s)}${d.bedtime && d.manual?.sleepMin == null ? `（${d.bedtime}〜${d.wake || ''}）` : ''}`);
+  if (d.sleepScore != null && d.manual?.sleepMin == null) parts.push(`睡眠スコア ${d.sleepScore}`);
+  if (e != null) parts.push(`運動 ${e}分`);
+  if (d.steps != null) parts.push(`${d.steps.toLocaleString()}歩`);
+  return parts.join('・');
+}
+
+function importDaily(j) {
+  let n = 0;
+  for (const r of j.days || []) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(r.date)) continue;
+    const { date, ...vals } = r;
+    const cur = state.daily[date] || {};
+    state.daily[date] = { ...cur, ...vals, source: j.source || 'import', manual: cur.manual };
+    if (!state.daily[date].manual) delete state.daily[date].manual;
+    n++;
+  }
+  state.settings.lastDailyImport = new Date().toISOString();
+  save(); render(); toast(`${n}日分の睡眠・運動を取り込みました`);
+}
+
+function dailyForm(k) {
+  const d = state.daily[k] || {};
+  const s = sleepOf(k), e = exerciseOf(k);
+  openSheet(`<h3>${fmtDate(k + 'T12:00')}の睡眠・運動</h3><form id="dailyForm">
+    <div class="field"><span class="lbl">前夜の睡眠時間</span>
+      <div class="row" style="flex-wrap:nowrap"><input type="number" name="sh" min="0" max="24" inputmode="numeric" value="${s != null ? Math.floor(s / 60) : ''}" style="width:5em"> 時間
+      <input type="number" name="sm" min="0" max="59" step="5" inputmode="numeric" value="${s != null ? s % 60 : ''}" style="width:5em"> 分</div>
+      ${d.sleepMin != null ? `<p class="muted">Garminの値：${fmtMin(d.sleepMin)}。手入力するとそちらを使います。</p>` : ''}
+    </div>
+    <div class="field"><span class="lbl">運動時間</span>
+      <div class="row" style="flex-wrap:nowrap"><input type="number" name="ex" min="0" max="1440" inputmode="numeric" value="${e ?? ''}" style="width:6em"> 分</div>
+      ${d.exerciseMin != null ? `<p class="muted">Garminの値：${d.exerciseMin}分（${esc((d.activities || []).map(a => a.name || a.type).join('、'))}）</p>` : ''}
+    </div>
+    <div class="sheet-actions"><button type="button" class="btn" data-act="close">キャンセル</button><button class="btn primary">保存</button></div>
+  </form>`);
+  const f = $('#dailyForm');
+  f.addEventListener('submit', ev => {
+    ev.preventDefault();
+    const x = state.daily[k] || {}; const manual = {};
+    if (f.sh.value !== '' || f.sm.value !== '') {
+      const v = (+f.sh.value || 0) * 60 + (+f.sm.value || 0);
+      if (v !== x.sleepMin) manual.sleepMin = v;
+    }
+    if (f.ex.value !== '' && +f.ex.value !== x.exerciseMin) manual.exerciseMin = +f.ex.value;
+    x.manual = manual;
+    if (!Object.keys(manual).length) delete x.manual;
+    if (Object.keys(x).length) state.daily[k] = x; else delete state.daily[k];
+    save(); closeSheet(); render(); toast('保存しました');
+  });
+}
+
+// 期間内で、睡眠・運動の記録がある日について頭痛があった割合を比べる
+function sleepExerciseStats(fromTs) {
+  const headDays = new Set(state.attacks.map(a => dayKey(a.start)));
+  const fromK = dayKey(fromTs), toK = dayKey(Date.now());
+  const g = { short: [0, 0], normal: [0, 0], ex: [0, 0], noex: [0, 0] };
+  let sleepSum = 0, sleepN = 0;
+  for (const k of Object.keys(state.daily)) {
+    if (k < fromK || k > toK) continue;
+    const h = headDays.has(k) ? 1 : 0;
+    const s = sleepOf(k);
+    if (s != null) { const b = s < SHORT_SLEEP ? g.short : g.normal; b[0]++; b[1] += h; sleepSum += s; sleepN++; }
+    const e = exerciseOf(k);
+    if (e != null) { const b = e >= EXERCISE_DAY ? g.ex : g.noex; b[0]++; b[1] += h; }
+  }
+  return { ...g, sleepAvg: sleepN ? sleepSum / sleepN : null, sleepN };
+}
+function rateLine(label, [n, h]) {
+  return n ? `<tr><td>${label}</td><td>${n}日</td><td>${h}日（${Math.round(h / n * 100)}%）</td></tr>` : `<tr><td>${label}</td><td>0日</td><td>-</td></tr>`;
+}
 const sortedAttacks = () => [...state.attacks].sort((a, b) => b.start.localeCompare(a.start));
 const ongoingAttack = () => state.attacks.find(a => !a.end);
 
@@ -441,6 +528,8 @@ function viewCalendar() {
     <p class="small" style="margin:8px 0 0">この月：頭痛 ${mDays}日・頭痛薬 ${mMed}日</p>
   </div>
   <div class="card"><h2>${fmtDate(selDate)}</h2>
+    <div class="row between small" style="margin-bottom:6px;flex-wrap:nowrap"><span>${dailyLine(calSel) || '<span class="muted">睡眠・運動の記録なし</span>'}</span>
+      <button class="btn" data-act="edit-daily" style="flex:none">睡眠・運動</button></div>
     ${sel && sel.attacks.length ? `<ul class="list">${sel.attacks.map(attackItem).join('')}</ul>` : '<p class="muted">頭痛の記録はありません</p>'}
     ${sel && sel.doses.filter(d => !d.attackId).length ? `<p class="small" style="margin-bottom:4px">頭痛と結びつけていない服薬</p><ul class="list">${sel.doses.filter(d => !d.attackId).map(d =>
       `<li data-act="edit-dose" data-id="${d.id}">${fmtTime(d.time)} ${esc(medById(d.medId)?.name || '薬')}${d.effect != null ? `（${EFFECT[d.effect]}）` : ''}</li>`).join('')}</ul>` : ''}
@@ -491,6 +580,18 @@ function monthlyChart(n = 6) {
   return `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="月ごとの頭痛日数と服薬日数">${line10}${bars}</svg>
     <div class="legend"><span><i style="background:var(--mig)"></i>頭痛があった日数</span><span><i style="background:var(--accent);opacity:.45"></i>頭痛薬を飲んだ日数</span><span>赤い点線：月10日</span></div>`;
 }
+function sleepExerciseCard(range) {
+  const g = sleepExerciseStats(Date.now() - range * DAY);
+  if (!g.sleepN && !(g.ex[0] + g.noex[0]))
+    return `<div class="card"><h2>睡眠・運動との関係</h2><p class="muted" style="margin:0">カレンダーで日付を選んで睡眠・運動を入力するか、設定からGarminのデータを取り込むと集計します。</p></div>`;
+  return `<div class="card"><h2>睡眠・運動との関係</h2>
+    <p class="small" style="margin-top:0">睡眠を記録した${g.sleepN}日の平均睡眠時間は${fmtMin(Math.round(g.sleepAvg || 0))}です。</p>
+    <table><tr><th>条件</th><th>日数</th><th>頭痛があった日</th></tr>
+      ${rateLine('前夜の睡眠6時間未満', g.short)}${rateLine('前夜の睡眠6時間以上', g.normal)}
+      ${rateLine(`運動${EXERCISE_DAY}分以上`, g.ex)}${rateLine(`運動${EXERCISE_DAY}分未満`, g.noex)}</table>
+    <p class="muted">割合は、条件に当てはまる日のうち頭痛があった日の割合です。日数が少ないうちは差が偶然出やすく、差があっても睡眠や運動が原因とは限りません。</p>
+  </div>`;
+}
 function viewStats() {
   const st = statsFor(Date.now() - statsRange * DAY);
   const n = st.as.length;
@@ -511,6 +612,7 @@ function viewStats() {
   <div class="card"><h2>きっかけ</h2>${barList(st.triggers, n)}</div>
   <div class="card"><h2>気圧との関係</h2>${st.withP ? `<p class="small" style="margin:0">気圧を記録できた${st.withP}回の頭痛のうち、始まる前の6時間で気圧が2hPa以上下がっていたのは${st.pDrop}回（${Math.round(st.pDrop / st.withP * 100)}%）です。</p>
     <p class="muted">気圧が下がらない日にも頭痛は起きるため、この割合だけで気圧が原因とは言えません。記録が増えるほど傾向を読みやすくなります。</p>` : '<p class="muted">地域を登録してから記録した頭痛について、気圧の変化を集計します。</p>'}</div>
+  ${sleepExerciseCard(statsRange)}
   <div class="card"><h2>薬の効き目</h2>${medRows ? `<table><tr><th>薬</th><th>回数</th><th>平均の効き目</th></tr>${medRows}</table>` : '<p class="muted">服薬の記録がありません</p>'}</div>
   <button class="btn primary block" data-act="goto-report">受診用レポートを作る</button>`;
 }
@@ -521,9 +623,11 @@ function viewReport() {
   const from = Date.now() - reportRange * DAY;
   const st = statsFor(from);
   const md30 = medDays(Date.now() - 30 * DAY);
+  const sx = sleepExerciseStats(from);
   const rows = [...st.as].sort((a, b) => a.start.localeCompare(b.start)).map(a => {
     const ds = state.doses.filter(d => d.attackId === a.id);
-    return `<tr><td>${fmtDate(a.start)}<br>${fmtTime(a.start)}</td><td>${a.end ? fmtDur(new Date(a.end) - new Date(a.start)) : '継続中'}</td>
+    const sl = sleepOf(dayKey(a.start));
+    return `<tr><td>${fmtDate(a.start)}<br>${fmtTime(a.start)}${sl != null ? `<br><span class="muted">睡眠${fmtMin(sl)}</span>` : ''}</td><td>${a.end ? fmtDur(new Date(a.end) - new Date(a.start)) : '継続中'}</td>
       <td>${TYPES[a.type]}</td><td>${a.intensity}</td>
       <td>${esc([...a.locations, ...a.qualities, ...a.symptoms].join('、'))}</td>
       <td>${ds.map(d => esc(medById(d.medId)?.name || '薬') + (d.effect != null ? `（${EFFECT[d.effect]}）` : '')).join('<br>')}</td>
@@ -546,6 +650,8 @@ function viewReport() {
       <tr><th>平均の強さ</th><td>${st.as.length ? st.avg.toFixed(1) : '-'}（0〜10の自己評価）</td></tr>
       <tr><th>平均の持続時間</th><td>${st.avgDur ? fmtDur(st.avgDur) : '-'}</td></tr>
       <tr><th>頭痛薬を飲んだ日数</th><td>${st.medDays}日（予防薬を除く）、直近30日では${md30.all}日</td></tr>
+      ${sx.sleepN ? `<tr><th>睡眠</th><td>記録した${sx.sleepN}日の平均${fmtMin(Math.round(sx.sleepAvg))}。6時間未満の日は${sx.short[0]}日で、そのうち頭痛があった日は${sx.short[1]}日</td></tr>` : ''}
+      ${sx.ex[0] + sx.noex[0] ? `<tr><th>運動</th><td>${EXERCISE_DAY}分以上運動した日は${sx.ex[0]}日（記録した${sx.ex[0] + sx.noex[0]}日のうち）</td></tr>` : ''}
       <tr><th>多かった症状</th><td>${esc(st.symptoms.slice(0, 5).map(([k, v]) => `${k} ${v}回`).join('、')) || '-'}</td></tr>
       <tr><th>多かったきっかけ</th><td>${esc(st.triggers.slice(0, 5).map(([k, v]) => `${k} ${v}回`).join('、')) || '-'}</td></tr>
     </table>
@@ -573,6 +679,10 @@ function viewSettings() {
       <span><button class="btn" data-act="edit-med" data-id="${m.id}">編集</button></span></div></li>`).join('')}</ul>
     <button class="btn block" data-act="add-med" style="margin-top:8px">＋ 薬を追加</button>
     <p class="muted">種類を「予防薬」にした薬は、頭痛薬を飲んだ日数に数えません。</p>
+  </div>
+  <div class="card"><h2>Garminの睡眠・運動</h2>
+    <p class="small" style="margin-top:0">PCで <code>garmin_sync/fetch_garmin.py</code> を実行して書き出したJSONを、下の「読み込み」で選ぶと取り込めます。頭痛の記録は置き換わりません。</p>
+    <p class="muted">${state.settings.lastDailyImport ? `最後に取り込んだ日時：${fmtDate(state.settings.lastDailyImport)} ${fmtTime(state.settings.lastDailyImport)}・` : ''}睡眠・運動 ${Object.keys(state.daily).length}日分</p>
   </div>
   <div class="card"><h2>データ</h2>
     <p class="small" style="margin-top:0">記録はこの端末のブラウザの中だけに保存しています。ブラウザのデータを消すと記録も消えるため、ときどき書き出して保管してください。</p>
@@ -627,6 +737,7 @@ function importData(file) {
   r.onload = () => {
     try {
       const j = JSON.parse(r.result);
+      if (j.format === 'headache-note-daily') return importDaily(j);
       if (!Array.isArray(j.attacks) || !Array.isArray(j.doses) || !Array.isArray(j.meds)) throw new Error('形式が違います');
       if (!confirm(`頭痛${j.attacks.length}件・服薬${j.doses.length}件を読み込みます。今の記録は置き換わります。よろしいですか？`)) return;
       state = Object.assign(defaultState(), j, { weather: null }); delete state.exportedAt;
@@ -634,6 +745,7 @@ function importData(file) {
     } catch (e) { alert('読み込めませんでした：' + e.message); }
   };
   r.readAsText(file);
+  const inp = $('#importFile'); if (inp) inp.value = ''; // 同じファイルをもう一度選べるようにする
 }
 
 // ---------- イベント ----------
@@ -676,6 +788,7 @@ document.addEventListener('click', e => {
     case 'cal-prev': calMonth = new Date(calMonth.getFullYear(), calMonth.getMonth() - 1, 1); render(); break;
     case 'cal-next': calMonth = new Date(calMonth.getFullYear(), calMonth.getMonth() + 1, 1); render(); break;
     case 'cal-day': calSel = el.dataset.k; render(); break;
+    case 'edit-daily': dailyForm(calSel); break;
     case 'cal-add-attack': { const a = newAttack(new Date(calSel + 'T12:00').getTime()); a.end = new Date(calSel + 'T14:00').toISOString(); attackForm(a); break; }
     case 'cal-add-dose': doseForm({ id: uid(), medId: state.meds[0]?.id, time: new Date(calSel + 'T12:00').getTime(), effect: null, attackId: null }); break;
     case 'city-search': citySearch(); break;

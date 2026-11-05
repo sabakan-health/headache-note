@@ -1,0 +1,4 @@
+# Garminから取得した健康データは公開リポジトリに含めない
+garmin_sync/out/
+garmin_sync/raw/
+__pycache__/
